@@ -4646,6 +4646,16 @@ window.__APEX_BOOT = function () {
       row.appendChild(dot); row.appendChild(who); row.appendChild(st);
       lbEls.net.appendChild(row);
     });
+    /* Enough to tell, from either machine, whether the racing layer is
+       actually alive — rather than inferring it from an empty circuit. */
+    const diag = document.createElement('div');
+    diag.id = 'lbNetNote';
+    const ago = lastPacket ? Math.round(performance.now() - lastPacket) : null;
+    diag.textContent = 'Racing layer: ' + (mpOn ? 'armed' : 'idle')
+      + ' \u00b7 your slot ' + (mySlot < 0 ? 'unassigned' : mySlot)
+      + ' \u00b7 ' + RIVALS.size + ' rival' + (RIVALS.size === 1 ? '' : 's') + ' tracked'
+      + ' \u00b7 ' + (ago == null ? 'nothing received yet' : 'last packet ' + ago + 'ms ago');
+    lbEls.net.appendChild(diag);
     const anyRelay = PEERS.some(function (p) { return p.route === 'relayed'; });
     const anyBad = PEERS.some(function (p) { return p.state === 'failed'; });
     if (anyBad || anyRelay) {
@@ -4819,7 +4829,16 @@ window.__APEX_BOOT = function () {
   const RIVALS = new Map();       // slot -> { body, prev, next, name, lap, prog, spin, roll, pitch }
   let sendClock = 0;
   const inbox = new Map();        // host only: slot -> latest state from that member
-  let readySet = new Set(), goSent = false, waitingToGo = false, goDeadline = 0;
+  /* Keyed by round, and never cleared when a race is armed. A member's
+     "ready" routinely lands before the host has finished building its own
+     copy of the circuit, and the old code reset this set at that moment —
+     discarding an answer that had already arrived and then waiting the
+     full seven seconds for it to come again. */
+  const readyByRound = new Map();     // round -> Set of uids
+  let goSent = false, waitingToGo = false, goDeadline = 0;
+  let mpRound = -1;                   // the round this machine is armed for
+  let goQueued = -1;                  // a go that arrived before we were ready
+  let lastPacket = 0;
 
   /* Slots are worked out from the member list rather than handed round,
      because every machine already has that list and sorting it the same
@@ -4888,6 +4907,12 @@ window.__APEX_BOOT = function () {
     sendClock += dt;
     if (sendClock < 1 / NET_HZ) return;
     sendClock = 0;
+    /* The member list can land after a race has been armed, and a slot of
+       -1 meant the host silently left itself out of its own snapshot — so
+       every member saw an empty circuit. Re-derived rather than trusted
+       once, and the host falls back to the first slot regardless. */
+    if (mySlot < 0) assignSlots();
+    if (mySlot < 0 && amHost()) mySlot = 0;
     const st = myState();
     if (amHost()) {
       /* The host is the only one who can see everybody, so it is the only
@@ -5006,33 +5031,43 @@ window.__APEX_BOOT = function () {
      Each machine builds the circuit, says it is ready, and the host drops
      the flag down the fast channel once everyone has answered. Nobody is
      left staring at half-built geometry while the rest pull away. */
+  function readySetFor(round) {
+    if (!readyByRound.has(round)) readyByRound.set(round, new Set());
+    return readyByRound.get(round);
+  }
   function mpArm(party) {
+    const round = party.round || 0;
     mpOn = true;
+    mpRound = round;
     assignSlots();
     clearRivals();
-    readySet = new Set(); goSent = false;
+    goSent = false;
     if (amHost()) {
+      readySetFor(round).add(CLOUD.user.uid);
       waitingToGo = true;
       goDeadline = performance.now() + 7000;
-      readySet.add(CLOUD.user.uid);
       mpMaybeGo();
     } else {
-      if (CLOUD.api) CLOUD.api.netSend({ t: 'ready' }, true);
       waitingToGo = false;
+      if (CLOUD.api) CLOUD.api.netSend({ t: 'ready', r: round }, true);
+      /* The flag can drop before this machine has finished building, in
+         which case the go was parked rather than lost. */
+      if (goQueued === round) { goQueued = -1; beginRun(); return; }
     }
     flashAll('Lining up', 'waiting for the others', 2000);
   }
   function mpMaybeGo() {
-    if (!amHost() || goSent) return;
-    const need = MEMBERS.length;
-    if (readySet.size >= need || performance.now() > goDeadline) {
+    if (!amHost() || goSent || mpRound < 0) return;
+    const need = Math.max(1, MEMBERS.length);
+    if (readySetFor(mpRound).size >= need || performance.now() > goDeadline) {
       goSent = true; waitingToGo = false;
-      if (CLOUD.api) CLOUD.api.netSend({ t: 'go' }, true);
+      if (CLOUD.api) CLOUD.api.netSend({ t: 'go', r: mpRound }, true);
       beginRun();
     }
   }
   function mpEnd() {
-    mpOn = false; waitingToGo = false;
+    mpOn = false; waitingToGo = false; mpRound = -1; goQueued = -1;
+    readyByRound.clear();
     clearRivals();
     if (standEl) standEl.style.display = 'none';
   }
@@ -5050,6 +5085,7 @@ window.__APEX_BOOT = function () {
   function netHandle(fromUid, msg) {
     if (!msg || typeof msg !== 'object') return;
     netSeen++;
+    lastPacket = performance.now();
     netLastFrom = fromUid;
     if (msg.t === 'ping') {
       /* Straight back, so a round trip can be timed from one end. */
@@ -5079,13 +5115,17 @@ window.__APEX_BOOT = function () {
     }
     if (msg.t === 'ready') {
       if (!amHost()) return;
-      readySet.add(fromUid);
+      /* Recorded against the round it names, so an early answer survives
+         until this machine catches up and comes looking for it. */
+      readySetFor(typeof msg.r === 'number' ? msg.r : 0).add(fromUid);
       mpMaybeGo();
       return;
     }
     if (msg.t === 'go') {
       if (amHost()) return;
-      beginRun();
+      const r = typeof msg.r === 'number' ? msg.r : 0;
+      if (mpOn && mpRound === r) beginRun();
+      else goQueued = r;          // still building; mpArm will pick it up
       return;
     }
   }
@@ -5938,7 +5978,7 @@ async function respondShare(id, take) {
 const PARTY_MAX = 8;
 let partyCode = null, partyDoc = null, partyMembers = [];
 let unsubParty = null, unsubMembers = null, unsubInvIn = null, unsubInvOut = null;
-let heartbeat = null, lastRound = -1;
+let heartbeat = null, lastRound = -1, launchedRound = -1;
 
 function partySay(kind, msg) { if (GAME && GAME.partyNote) GAME.partyNote(kind, msg); }
 function pushParty() {
@@ -6014,8 +6054,17 @@ function watchParty(code) {
     /* A round number that has moved is the signal to go racing. Using the
        counter rather than a "start now" flag means a player who reloads
        mid-round is not dragged into a race that already began. */
+    /* The first snapshot only establishes where the counter currently is.
+       Launching off it would drag somebody joining a party into a race
+       that started before they arrived, and comparing against the previous
+       snapshot alone could fire the same round twice if the document is
+       written again mid-race. Recording the round that was launched is
+       both simpler and exact. */
     const r = partyDoc.round || 0;
-    if (prev && r > (prev.round || 0) && partyDoc.status === 'racing') {
+    if (launchedRound < 0) {
+      launchedRound = r;
+    } else if (partyDoc.status === 'racing' && r > launchedRound) {
+      launchedRound = r;
       if (GAME && GAME.partyLaunch) GAME.partyLaunch(partyDoc);
     }
     lastRound = r;
@@ -6058,7 +6107,7 @@ function stopParty(tellGame) {
   if (unsubParty)   { try { unsubParty(); }   catch (e) {} unsubParty = null; }
   if (unsubMembers) { try { unsubMembers(); } catch (e) {} unsubMembers = null; }
   clearInterval(heartbeat); heartbeat = null;
-  partyCode = null; partyDoc = null; partyMembers = []; lastRound = -1;
+  partyCode = null; partyDoc = null; partyMembers = []; lastRound = -1; launchedRound = -1;
   if (tellGame) pushParty();
 }
 
